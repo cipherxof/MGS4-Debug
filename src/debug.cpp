@@ -3,8 +3,10 @@
 #include "MinHook.h"
 #include "utils.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <spdlog/spdlog.h>
@@ -29,6 +31,9 @@ namespace
     using ImGuiBeginTabItemDelegate = bool(__fastcall*)(const char* label, bool* open, uint32_t flags);
     using ImGuiEndTabItemDelegate = void(__fastcall*)();
     using ImGuiCheckboxDelegate = bool(__fastcall*)(const char* label, bool* value);
+    using ImGuiItemGetterDelegate = bool(__fastcall*)(void* data, int32_t index, const char** text);
+    using ImGuiComboDelegate = bool(__fastcall*)(const char* label, int32_t* currentItem,
+        ImGuiItemGetterDelegate getter, void* data, int32_t itemCount, int32_t popupMaxHeight);
 
     struct ImGuiVec2
     {
@@ -40,6 +45,34 @@ namespace
     using SetCursorModeDelegate = void(__fastcall*)(int32_t mode, int32_t value);
     using DebugTextDelegate = void(__fastcall*)(uint16_t x, uint16_t y, uint8_t color, const char* text);
     using GetSnakeDelegate = uintptr_t(__fastcall*)();
+    using StageRequestBlockedDelegate = int32_t(__fastcall*)();
+    using SetStageNameDelegate = void(__fastcall*)(const char* stageName);
+    using FinalizeStageRequestDelegate = void(__fastcall*)();
+
+    struct StageMapNode
+    {
+        StageMapNode* left;
+        StageMapNode* parent;
+        StageMapNode* right;
+        uint8_t color;
+        uint8_t isNil;
+        uint8_t padding[6];
+        char nameStorage[16];
+        size_t nameSize;
+        size_t nameCapacity;
+        uint32_t stageId;
+    };
+
+    static_assert(offsetof(StageMapNode, nameStorage) == 0x20);
+    static_assert(offsetof(StageMapNode, nameSize) == 0x30);
+    static_assert(offsetof(StageMapNode, nameCapacity) == 0x38);
+    static_assert(offsetof(StageMapNode, stageId) == 0x40);
+
+    struct StageEntry
+    {
+        std::string name;
+        uint32_t id;
+    };
 
     DebugUiFrameDelegate DebugUiFrame = nullptr;
     DebugUiRenderDelegate DebugUiRender = nullptr;
@@ -56,27 +89,143 @@ namespace
     ImGuiBeginTabItemDelegate ImGuiBeginTabItem = nullptr;
     ImGuiEndTabItemDelegate ImGuiEndTabItem = nullptr;
     ImGuiCheckboxDelegate ImGuiCheckbox = nullptr;
+    ImGuiComboDelegate ImGuiCombo = nullptr;
     ImGuiButtonDelegate ImGuiButton = nullptr;
     SetCursorModeDelegate SetCursorMode = nullptr;
     DebugTextDelegate DebugText = nullptr;
     GetSnakeDelegate GetSnake = nullptr;
+    StageRequestBlockedDelegate StageRequestBlocked = nullptr;
+    SetStageNameDelegate SetStageName = nullptr;
+    FinalizeStageRequestDelegate FinalizeStageRequest = nullptr;
 
     float* DynamicResolutionState = nullptr;
     uint8_t* DynamicResolutionEnabled = nullptr;
     int32_t* ImGuiRenderGate = nullptr;
     uint8_t* MiscDisplayFlags = nullptr;
+    StageMapNode** StageMapHeadStorage = nullptr;
+    uint32_t* StageRequestFlags = nullptr;
+    uint32_t* FastLoadStageId = nullptr;
+    uint32_t* FastLoadMode = nullptr;
 
     std::atomic_bool MenuVisible{false};
     bool ToggleKeyDown = false;
+    bool DisableDynamicResolution = true;
     int ToggleKey = VK_F10;
     std::string GameVersionText;
     std::array<char, 128> SnakeLocationText{};
     ULONGLONG SnakeLocationExpiresAt = 0;
+    std::vector<StageEntry> StageEntries;
+    int32_t SelectedStage = 0;
+    uint32_t PendingStageId = 0;
+    std::string PendingStageName;
 
     constexpr int32_t GlfwCursorMode = 0x33001;
     constexpr int32_t GlfwCursorNormal = 0x34001;
     constexpr int32_t GlfwCursorDisabled = 0x34003;
     constexpr ptrdiff_t DynamicResolutionEnabledOffset = 0x1f8;
+
+    bool IsReadableMemory(const void* address, size_t length)
+    {
+        if (!address || length == 0)
+            return false;
+
+        MEMORY_BASIC_INFORMATION region{};
+        if (VirtualQuery(address, &region, sizeof(region)) != sizeof(region) ||
+            region.State != MEM_COMMIT || (region.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0)
+        {
+            return false;
+        }
+
+        const uintptr_t begin = reinterpret_cast<uintptr_t>(address);
+        const uintptr_t end = begin + length;
+        const uintptr_t regionEnd = reinterpret_cast<uintptr_t>(region.BaseAddress) + region.RegionSize;
+        return end >= begin && end <= regionEnd;
+    }
+
+    bool ReadStageName(const StageMapNode* node, std::string& name)
+    {
+        if (node->nameSize == 0 || node->nameSize >= 16)
+            return false;
+
+        const char* source = node->nameStorage;
+        if (node->nameCapacity >= sizeof(node->nameStorage))
+            std::memcpy(&source, node->nameStorage, sizeof(source));
+
+        if (!IsReadableMemory(source, node->nameSize + 1) || source[node->nameSize] != '\0')
+            return false;
+
+        name.assign(source, node->nameSize);
+        return true;
+    }
+
+    bool CollectStageEntries(StageMapNode* node, StageMapNode* head,
+        size_t& visited, std::vector<StageEntry>& entries)
+    {
+        if (!node || node == head)
+            return true;
+        if (!IsReadableMemory(node, sizeof(*node)))
+            return false;
+        if (node->isNil != 0)
+            return true;
+        if (++visited > 2048)
+            return false;
+
+        if (!CollectStageEntries(node->left, head, visited, entries))
+            return false;
+
+        std::string name;
+        if (node->stageId != 0 && ReadStageName(node, name) && name != "select")
+            entries.push_back({std::move(name), node->stageId});
+
+        return CollectStageEntries(node->right, head, visited, entries);
+    }
+
+    bool RefreshStageEntries()
+    {
+        if (!StageMapHeadStorage)
+            return false;
+
+        StageMapNode* head = *StageMapHeadStorage;
+        if (!IsReadableMemory(head, sizeof(*head)) || head->isNil == 0)
+            return false;
+
+        std::vector<StageEntry> entries;
+
+        size_t visited = 0;
+        if (!CollectStageEntries(head->parent, head, visited, entries) || entries.empty())
+            return false;
+
+        StageEntries = std::move(entries);
+        SelectedStage = std::clamp(SelectedStage, 0, static_cast<int32_t>(StageEntries.size() - 1));
+        spdlog::info("Loaded {} entries from the MGS4 stage registry", StageEntries.size());
+        return true;
+    }
+
+    bool __fastcall GetStageItem(void* data, int32_t index, const char** text)
+    {
+        const auto* entries = static_cast<const std::vector<StageEntry>*>(data);
+        if (!entries || !text || index < 0 || static_cast<size_t>(index) >= entries->size())
+            return false;
+
+        *text = (*entries)[index].name.c_str();
+        return true;
+    }
+
+    bool RequestStage(const StageEntry& stage)
+    {
+        if (StageRequestBlocked() != 0)
+        {
+            spdlog::warn("Cannot load stage '{}': a stage transition is already active", stage.name);
+            return false;
+        }
+
+        *FastLoadStageId = stage.id;
+        *FastLoadMode = 1;
+        SetStageName("select");
+        *StageRequestFlags |= 0x11;
+        FinalizeStageRequest();
+        return true;
+    }
 
     void SetMenuVisible(bool visible)
     {
@@ -160,6 +309,36 @@ namespace
         ImGuiEndTabItem();
     }
 
+    bool StageDeveloperTab()
+    {
+        if (!ImGuiBeginTabItem("Stage", nullptr, 0))
+            return false;
+
+        if (StageEntries.empty())
+            RefreshStageEntries();
+
+        if (StageEntries.empty())
+        {
+            ImGuiEndTabItem();
+            return false;
+        }
+
+        ImGuiCombo("Stage", &SelectedStage, GetStageItem, &StageEntries,
+            static_cast<int32_t>(StageEntries.size()), 18);
+
+        constexpr ImGuiVec2 ButtonSize{};
+        const bool loadStage = ImGuiButton("Load Stage", &ButtonSize);
+        const StageEntry selected = StageEntries[SelectedStage];
+        ImGuiEndTabItem();
+
+        if (!loadStage)
+            return false;
+
+        PendingStageId = selected.id;
+        PendingStageName = selected.name;
+        return true;
+    }
+
     void RenderDeveloperOverlays()
     {
         StageNameDebugOverlay();
@@ -179,6 +358,9 @@ namespace
             SetMenuVisible(!MenuVisible.load(std::memory_order_relaxed));
         ToggleKeyDown = keyDown;
 
+        if (DisableDynamicResolution)
+            *DynamicResolutionEnabled = 0;
+
         RenderDeveloperOverlays();
         DebugUiFrame();
 
@@ -189,16 +371,35 @@ namespace
         {
             if (ImGuiBeginTabBar("MGS4DeveloperTabs", 0))
             {
-                PerformanceDebugTab();
-                if (*DynamicResolutionEnabled != 0)
-                    DynamicResolutionDebugTab(DynamicResolutionState);
-                DofAdjustDebugTab();
-                MiscDeveloperTab();
-                MessageDebugTab();
+                if (!StageDeveloperTab())
+                {
+                    PerformanceDebugTab();
+                    if (*DynamicResolutionEnabled != 0)
+                        DynamicResolutionDebugTab(DynamicResolutionState);
+                    DofAdjustDebugTab();
+                    MiscDeveloperTab();
+                    MessageDebugTab();
+                }
                 ImGuiEndTabBar();
             }
         }
         ImGuiEnd();
+
+        if (PendingStageId != 0)
+        {
+            const uint32_t stageId = PendingStageId;
+            const std::string stageName = std::move(PendingStageName);
+            PendingStageId = 0;
+            PendingStageName.clear();
+
+            const StageEntry stage{stageName, stageId};
+            if (!RequestStage(stage))
+                return;
+
+            spdlog::info("Queued fast-load stage '{}' (registry id {:#x}) through the select handoff",
+                stageName, stageId);
+            SetMenuVisible(false);
+        }
     }
 
     void __fastcall DebugUiRenderHook(uint16_t viewId)
@@ -294,9 +495,20 @@ namespace
         constexpr char ImGuiEndTabBarPattern[] =
             "48 89 74 24 10 57 48 83 EC 20 48 8B 3D ?? ?? ?? ?? 48 8B B7 A8 11 00 00 "
             "80 BE B3 00 00 00 00 0F 85 ?? ?? ?? ?? 48 89 5C 24 30";
+        constexpr char ImGuiComboPattern[] =
+            "48 89 5C 24 18 48 89 6C 24 20 57 41 54 41 55 41 56 41 57 48 83 EC 40 "
+            "48 8B 05 ?? ?? ?? ?? 33 FF 44 8B B4 24 90 00 00 00 4C 8B FA 8B 12 4D 8B E1";
         constexpr char CursorModePattern[] =
             "48 89 5C 24 08 57 48 83 EC 20 8B F9 8B DA 48 8D 0D ?? ?? ?? ?? E8 ?? ?? ?? ?? "
             "48 8B C8 44 8B C3 8B D7 48 8B 5C 24 30 48 83 C4 20 5F E9 ?? ?? ?? ??";
+        constexpr char FastLoadStagePattern[] =
+            "40 57 41 56 41 57 48 83 EC 20 48 8B F9 48 8B 0D ?? ?? ?? ?? 48 85 C9 74 ?? "
+            "FF 15 ?? ?? ?? ?? 4C 8B 7F 18 48 8B C7 4C 8B 77 10 49 83 FF 10 72 ?? "
+            "48 8B 07 49 83 FE 06 75 ?? 81 38 73 65 6C 65 75 ??";
+        constexpr char StageRequestHandlerPattern[] =
+            "48 83 EC 28 E8 ?? ?? ?? ?? 85 C0 0F 85 ?? ?? ?? ?? 48 89 5C 24 20 "
+            "E8 ?? ?? ?? ?? 48 8B D8 80 38 00 0F 84 ?? ?? ?? ?? B1 6E E8 ?? ?? ?? ?? "
+            "48 85 C0 74 ?? E8 ?? ?? ?? ?? 48 85 C0 74 ?? E8 ?? ?? ?? ?? 85 C0 75 ??";
 
         uint8_t* uiFrame = Utils::PatternScanRange(textBegin, textSize, UiFramePattern);
         uint8_t* uiRender = Utils::PatternScanRange(textBegin, textSize, UiRenderPattern);
@@ -313,12 +525,16 @@ namespace
         uint8_t* imguiEnd = Utils::PatternScanRange(textBegin, textSize, ImGuiEndPattern);
         uint8_t* imguiBeginTabBar = Utils::PatternScanRange(textBegin, textSize, ImGuiBeginTabBarPattern);
         uint8_t* imguiEndTabBar = Utils::PatternScanRange(textBegin, textSize, ImGuiEndTabBarPattern);
+        uint8_t* imguiCombo = Utils::PatternScanRange(textBegin, textSize, ImGuiComboPattern);
         uint8_t* cursorMode = Utils::PatternScanRange(textBegin, textSize, CursorModePattern);
+        uint8_t* fastLoadStage = Utils::PatternScanRange(textBegin, textSize, FastLoadStagePattern);
+        uint8_t* stageRequestHandler = Utils::PatternScanRange(
+            textBegin, textSize, StageRequestHandlerPattern);
 
         if (!uiFrame || !uiRender || !dynamicResolutionTab || !performanceTab || !messageTab ||
             !dofAdjustTab || !miscTab || !stageNameOverlay || !difficultyOverlay ||
             !dynamicResolutionInitializer || !imguiBegin || !imguiEnd || !imguiBeginTabBar ||
-            !imguiEndTabBar || !cursorMode)
+            !imguiEndTabBar || !imguiCombo || !cursorMode || !fastLoadStage || !stageRequestHandler)
         {
             spdlog::error("Failed to resolve one or more MGS4 developer UI targets");
             return false;
@@ -327,10 +543,19 @@ namespace
         constexpr std::array<uint8_t, 2> RenderGateLoadOpcode = {0x83, 0x3d};
         constexpr std::array<uint8_t, 3> DynamicResolutionStateLoadOpcode = {0x48, 0x8d, 0x0d};
         constexpr std::array<uint8_t, 3> MiscFlagsLoadOpcode = {0x48, 0x8d, 0x15};
+        constexpr std::array<uint8_t, 3> StageMapHeadLoadOpcode = {0x4c, 0x8b, 0x2d};
+        constexpr std::array<uint8_t, 2> FastLoadStageIdStoreOpcode = {0x89, 0x05};
         if (std::memcmp(uiRender + 0x0e, RenderGateLoadOpcode.data(), RenderGateLoadOpcode.size()) != 0 ||
             std::memcmp(dynamicResolutionInitializer + 0x19, DynamicResolutionStateLoadOpcode.data(),
                 DynamicResolutionStateLoadOpcode.size()) != 0 ||
             std::memcmp(miscTab + 0x20, MiscFlagsLoadOpcode.data(), MiscFlagsLoadOpcode.size()) != 0 ||
+            std::memcmp(fastLoadStage + 0x85, StageMapHeadLoadOpcode.data(),
+                StageMapHeadLoadOpcode.size()) != 0 ||
+            std::memcmp(fastLoadStage + 0x122, FastLoadStageIdStoreOpcode.data(),
+                FastLoadStageIdStoreOpcode.size()) != 0 ||
+            stageRequestHandler[0x04] != 0xe8 || stageRequestHandler[0xa8] != 0xe8 ||
+            stageRequestHandler[0xad] != 0x83 || stageRequestHandler[0xae] != 0x0d ||
+            stageRequestHandler[0xb3] != 0x01 || stageRequestHandler[0xd2] != 0xe8 ||
             miscTab[0x13] != 0xe8 || miscTab[0x2e] != 0xe8 || miscTab[0x87] != 0xe8 ||
             miscTab[0x98] != 0xe8 || miscTab[0x102] != 0xe8 || stageNameOverlay[0x77] != 0xe8)
         {
@@ -346,6 +571,13 @@ namespace
         DynamicResolutionEnabled = reinterpret_cast<uint8_t*>(DynamicResolutionState) +
             DynamicResolutionEnabledOffset;
         MiscDisplayFlags = reinterpret_cast<uint8_t*>(Utils::ResolveRelativeAddress(miscTab + 0x23));
+        StageMapHeadStorage = reinterpret_cast<StageMapNode**>(
+            Utils::ResolveRelativeAddress(fastLoadStage + 0x88));
+        FastLoadStageId = reinterpret_cast<uint32_t*>(
+            Utils::ResolveRelativeAddress(fastLoadStage + 0x124));
+        FastLoadMode = FastLoadStageId + 1;
+        StageRequestFlags = reinterpret_cast<uint32_t*>(
+            Utils::ResolveRelativeAddress(stageRequestHandler + 0xaf) + 1);
 
         DynamicResolutionDebugTab = reinterpret_cast<DynamicResolutionDebugTabDelegate>(dynamicResolutionTab);
         PerformanceDebugTab = reinterpret_cast<PerformanceDebugTabDelegate>(performanceTab);
@@ -368,7 +600,14 @@ namespace
         ImGuiEnd = reinterpret_cast<ImGuiEndDelegate>(imguiEnd);
         ImGuiBeginTabBar = reinterpret_cast<ImGuiBeginTabBarDelegate>(imguiBeginTabBar);
         ImGuiEndTabBar = reinterpret_cast<ImGuiEndTabBarDelegate>(imguiEndTabBar);
+        ImGuiCombo = reinterpret_cast<ImGuiComboDelegate>(imguiCombo);
         SetCursorMode = reinterpret_cast<SetCursorModeDelegate>(cursorMode);
+        StageRequestBlocked = reinterpret_cast<StageRequestBlockedDelegate>(
+            Utils::ResolveRelativeAddress(stageRequestHandler + 0x05));
+        SetStageName = reinterpret_cast<SetStageNameDelegate>(
+            Utils::ResolveRelativeAddress(stageRequestHandler + 0xa9));
+        FinalizeStageRequest = reinterpret_cast<FinalizeStageRequestDelegate>(
+            Utils::ResolveRelativeAddress(stageRequestHandler + 0xd3));
         GameVersionText = GetGameVersionText();
 
         Utils::LogAddress("debugUiFrame", reinterpret_cast<uintptr_t>(uiFrame), moduleBase);
@@ -386,9 +625,18 @@ namespace
         Utils::LogAddress("imguiEnd", reinterpret_cast<uintptr_t>(imguiEnd), moduleBase);
         Utils::LogAddress("imguiBeginTabBar", reinterpret_cast<uintptr_t>(imguiBeginTabBar), moduleBase);
         Utils::LogAddress("imguiEndTabBar", reinterpret_cast<uintptr_t>(imguiEndTabBar), moduleBase);
+        Utils::LogAddress("imguiCombo", reinterpret_cast<uintptr_t>(imguiCombo), moduleBase);
         Utils::LogAddress("dynamicResolutionState", reinterpret_cast<uintptr_t>(DynamicResolutionState), moduleBase);
         Utils::LogAddress("imguiRenderGate", reinterpret_cast<uintptr_t>(ImGuiRenderGate), moduleBase);
         Utils::LogAddress("setCursorMode", reinterpret_cast<uintptr_t>(cursorMode), moduleBase);
+        Utils::LogAddress("fastLoadStage", reinterpret_cast<uintptr_t>(fastLoadStage), moduleBase);
+        Utils::LogAddress("stageMapHead", reinterpret_cast<uintptr_t>(StageMapHeadStorage), moduleBase);
+        Utils::LogAddress("fastLoadStageId", reinterpret_cast<uintptr_t>(FastLoadStageId), moduleBase);
+        Utils::LogAddress("fastLoadMode", reinterpret_cast<uintptr_t>(FastLoadMode), moduleBase);
+        Utils::LogAddress("stageRequestFlags", reinterpret_cast<uintptr_t>(StageRequestFlags), moduleBase);
+        Utils::LogAddress("stageRequestBlocked", reinterpret_cast<uintptr_t>(StageRequestBlocked), moduleBase);
+        Utils::LogAddress("setStageName", reinterpret_cast<uintptr_t>(SetStageName), moduleBase);
+        Utils::LogAddress("finalizeStageRequest", reinterpret_cast<uintptr_t>(FinalizeStageRequest), moduleBase);
         spdlog::info("Game executable version text: {}", GameVersionText);
 
         if (MH_CreateHook(uiFrame, reinterpret_cast<LPVOID>(&DebugUiFrameHook),
@@ -414,9 +662,16 @@ bool MGS4Debug_Install(uintptr_t moduleBase, uint8_t* textBegin, uintptr_t textS
     const DebugConfig& config)
 {
     ToggleKey = config.toggleKey;
+    DisableDynamicResolution = config.disableDynamicResolution;
 
     if (!InstallDeveloperUi(moduleBase, textBegin, textSize))
         return false;
+
+    if (DisableDynamicResolution)
+    {
+        *DynamicResolutionEnabled = 0;
+        spdlog::info("Dynamic resolution disabled by config");
+    }
 
     if (config.disableFilter && !InstallDisableFilter(moduleBase, textBegin, textSize))
     {
