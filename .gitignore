@@ -1,0 +1,11 @@
+build/
+.vs/
+.vscode/
+*.log
+*.obj
+*.pdb
+*.dll
+*.asi
+*.a
+*.lib
+*.exp
