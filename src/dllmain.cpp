@@ -12,7 +12,7 @@
 
 namespace
 {
-    constexpr char Version[] = "0.1.0";
+    constexpr char Version[] = "0.0.3";
     constexpr wchar_t ConfigName[] = L"MGS4Debug.ini";
     constexpr wchar_t LogName[] = L"MGS4Debug.log";
     constexpr char LogPattern[] = "[%Y-%m-%d %H:%M:%S.%e] [MGS4Debug] [%l] %v";

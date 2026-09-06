@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(MGS4Debug VERSION 0.1.0 LANGUAGES C CXX)
+project(MGS4Debug VERSION 0.0.3 LANGUAGES C CXX)
 
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "Build shared libraries" FORCE)
 set(SPDLOG_BUILD_EXAMPLE OFF CACHE BOOL "Build spdlog examples" FORCE)
