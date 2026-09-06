@@ -10,7 +10,6 @@ struct DebugConfig
     int toggleKey = VK_F10;
     bool disableFilter = true;
     bool disableMotionBlur = true;
-    bool disableDynamicResolution = true;
 };
 
 bool LoadConfig(const std::filesystem::path& path, DebugConfig& config);

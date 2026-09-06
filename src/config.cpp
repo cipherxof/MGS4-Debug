@@ -68,8 +68,7 @@ bool LoadConfig(const std::filesystem::path& path, DebugConfig& config)
                 "Enabled = true\n"
                 "ToggleKey = F10\n"
                 "DisableFilter = true\n"
-                "DisableMotionBlur = true\n"
-                "DisableDynamicResolution = true\n";
+                "DisableMotionBlur = true\n";
         spdlog::info("Created config file {}", path.generic_string());
     }
 
@@ -79,13 +78,9 @@ bool LoadConfig(const std::filesystem::path& path, DebugConfig& config)
         ReadIniValue(path, L"DisableFilter", L"true"), true);
     config.disableMotionBlur = Utils::ParseBoolean(
         ReadIniValue(path, L"DisableMotionBlur", L"true"), true);
-    config.disableDynamicResolution = Utils::ParseBoolean(
-        ReadIniValue(path, L"DisableDynamicResolution", L"true"), true);
 
     spdlog::info(
-        "Config: enabled={}, toggleKey={:#x}, disableFilter={}, disableMotionBlur={}, "
-        "disableDynamicResolution={}",
-        config.enabled, config.toggleKey, config.disableFilter, config.disableMotionBlur,
-        config.disableDynamicResolution);
+        "Config: enabled={}, toggleKey={:#x}, disableFilter={}, disableMotionBlur={}",
+        config.enabled, config.toggleKey, config.disableFilter, config.disableMotionBlur);
     return true;
 }

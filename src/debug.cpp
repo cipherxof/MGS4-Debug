@@ -99,7 +99,6 @@ namespace
     FinalizeStageRequestDelegate FinalizeStageRequest = nullptr;
 
     float* DynamicResolutionState = nullptr;
-    uint8_t* DynamicResolutionEnabled = nullptr;
     int32_t* ImGuiRenderGate = nullptr;
     uint8_t* MiscDisplayFlags = nullptr;
     StageMapNode** StageMapHeadStorage = nullptr;
@@ -109,7 +108,6 @@ namespace
 
     std::atomic_bool MenuVisible{false};
     bool ToggleKeyDown = false;
-    bool DisableDynamicResolution = true;
     int ToggleKey = VK_F10;
     std::string GameVersionText;
     std::array<char, 128> SnakeLocationText{};
@@ -122,7 +120,6 @@ namespace
     constexpr int32_t GlfwCursorMode = 0x33001;
     constexpr int32_t GlfwCursorNormal = 0x34001;
     constexpr int32_t GlfwCursorDisabled = 0x34003;
-    constexpr ptrdiff_t DynamicResolutionEnabledOffset = 0x1f8;
 
     bool IsReadableMemory(const void* address, size_t length)
     {
@@ -358,9 +355,6 @@ namespace
             SetMenuVisible(!MenuVisible.load(std::memory_order_relaxed));
         ToggleKeyDown = keyDown;
 
-        if (DisableDynamicResolution)
-            *DynamicResolutionEnabled = 0;
-
         RenderDeveloperOverlays();
         DebugUiFrame();
 
@@ -374,8 +368,7 @@ namespace
                 if (!StageDeveloperTab())
                 {
                     PerformanceDebugTab();
-                    if (*DynamicResolutionEnabled != 0)
-                        DynamicResolutionDebugTab(DynamicResolutionState);
+                    DynamicResolutionDebugTab(DynamicResolutionState);
                     DofAdjustDebugTab();
                     MiscDeveloperTab();
                     MessageDebugTab();
@@ -568,8 +561,6 @@ namespace
         ImGuiRenderGate = reinterpret_cast<int32_t*>(uiRender + 0x15 + renderGateDisplacement);
         DynamicResolutionState = reinterpret_cast<float*>(
             Utils::ResolveRelativeAddress(dynamicResolutionInitializer + 0x1c));
-        DynamicResolutionEnabled = reinterpret_cast<uint8_t*>(DynamicResolutionState) +
-            DynamicResolutionEnabledOffset;
         MiscDisplayFlags = reinterpret_cast<uint8_t*>(Utils::ResolveRelativeAddress(miscTab + 0x23));
         StageMapHeadStorage = reinterpret_cast<StageMapNode**>(
             Utils::ResolveRelativeAddress(fastLoadStage + 0x88));
@@ -662,16 +653,9 @@ bool MGS4Debug_Install(uintptr_t moduleBase, uint8_t* textBegin, uintptr_t textS
     const DebugConfig& config)
 {
     ToggleKey = config.toggleKey;
-    DisableDynamicResolution = config.disableDynamicResolution;
 
     if (!InstallDeveloperUi(moduleBase, textBegin, textSize))
         return false;
-
-    if (DisableDynamicResolution)
-    {
-        *DynamicResolutionEnabled = 0;
-        spdlog::info("Dynamic resolution disabled by config");
-    }
 
     if (config.disableFilter && !InstallDisableFilter(moduleBase, textBegin, textSize))
     {
